@@ -14,8 +14,14 @@ use std::str;
 pub type ObjectId = (u32, u16);
 
 /// Dictionary object.
-#[derive(Clone, Default, PartialEq)]
-pub struct Dictionary(IndexMap<Vec<u8>, Object>);
+#[derive(Clone, Default)]
+pub struct Dictionary(IndexMap<Vec<u8>, Object>, bool);
+
+impl PartialEq for Dictionary {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
 
 /// Stream object
 /// Warning - all streams must be indirect objects, while
@@ -342,7 +348,20 @@ impl fmt::Debug for Object {
 
 impl Dictionary {
     pub fn new() -> Dictionary {
-        Dictionary(IndexMap::new())
+        Dictionary(IndexMap::new(), false)
+    }
+
+    /// Whether the parser encountered repeated decoded keys in this dictionary.
+    /// This is source provenance, not a verdict on a subsequently mutated dictionary.
+    pub fn has_duplicate_source_keys(&self) -> bool {
+        self.1
+    }
+
+    pub(crate) fn insert_parsed(&mut self, key: Vec<u8>, value: Object) {
+        if self.0.contains_key(&key) {
+            self.1 = true;
+        }
+        self.0.insert(key, value);
     }
 
     pub fn has(&self, key: &[u8]) -> bool {

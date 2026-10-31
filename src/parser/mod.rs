@@ -299,7 +299,7 @@ fn inner_dictionary(depth: usize) -> impl Fn(ParserInput) -> NomResult<Dictionar
             pair(terminated(name, space), _direct_object(depth)),
             Dictionary::new,
             |mut dict, (key, value)| {
-                dict.set(key, value);
+                dict.insert_parsed(key, value);
                 dict
             },
         )
@@ -329,7 +329,7 @@ pub(crate) fn dict_dup(input: ParserInput) -> NomResult<Dictionary> {
             ),
             Dictionary::new,
             |mut dict, (key, value)| {
-                dict.set(key, value);
+                dict.insert_parsed(key, value);
                 dict
             },
         ),
@@ -1376,3 +1376,23 @@ EI";
         assert!(obj.is_ok());
     }
 }
+
+#[cfg(test)]
+mod duplicate_source_key_tests {
+    use super::direct_object;
+
+    #[test]
+    fn duplicate_source_keys_are_recorded_on_their_own_dictionary() {
+        let object = direct_object(b"<< /Outer << /GTS_Metadata 99 0 R /GTS#5fMetadata null >> /Name /x >>").unwrap();
+        let outer = object.as_dict().unwrap();
+        assert!(!outer.has_duplicate_source_keys());
+        let nested = outer.get(b"Outer").unwrap().as_dict().unwrap();
+        assert!(nested.has_duplicate_source_keys());
+        assert!(matches!(nested.get(b"GTS_Metadata").unwrap(), crate::Object::Null));
+        let distinct = direct_object(b"<< /GTS_Metadata null /Name /x >>").unwrap();
+        assert!(!distinct.as_dict().unwrap().has_duplicate_source_keys());
+    }
+}
+
+#[cfg(test)]
+mod provenance_qualification_tests;
