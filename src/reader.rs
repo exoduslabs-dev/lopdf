@@ -87,6 +87,7 @@ impl Document {
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
             normal_offsets: Vec::new(),
+            admission: None,
         }
         .read(options.filter)
     }
@@ -107,6 +108,7 @@ impl Document {
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
             normal_offsets: Vec::new(),
+            admission: None,
         }
         .read(options.filter)
     }
@@ -158,6 +160,7 @@ impl Document {
             strict: false,
             max_decompressed_size: None,
             normal_offsets: Vec::new(),
+            admission: None,
         }
         .read_metadata()
     }
@@ -174,6 +177,7 @@ impl Document {
             strict: false,
             max_decompressed_size: None,
             normal_offsets: Vec::new(),
+            admission: None,
         }
         .read_metadata()
     }
@@ -193,6 +197,7 @@ impl Document {
             strict: false,
             max_decompressed_size: None,
             normal_offsets: Vec::new(),
+            admission: None,
         }
         .read_metadata()
     }
@@ -237,6 +242,7 @@ impl Document {
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
             normal_offsets: Vec::new(),
+            admission: None,
         }
         .read(options.filter)
     }
@@ -257,6 +263,7 @@ impl Document {
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
             normal_offsets: Vec::new(),
+            admission: None,
         }
         .read(options.filter)
     }
@@ -304,6 +311,7 @@ impl Document {
             strict: false,
             max_decompressed_size: None,
             normal_offsets: Vec::new(),
+            admission: None,
         }
         .read_metadata()
     }
@@ -320,6 +328,7 @@ impl Document {
             strict: false,
             max_decompressed_size: None,
             normal_offsets: Vec::new(),
+            admission: None,
         }
         .read_metadata()
     }
@@ -341,6 +350,7 @@ impl Document {
             strict: false,
             max_decompressed_size: None,
             normal_offsets: Vec::new(),
+            admission: None,
         }
         .read_metadata()
     }
@@ -359,6 +369,7 @@ impl TryInto<Document> for &[u8] {
             strict: false,
             max_decompressed_size: None,
             normal_offsets: Vec::new(),
+            admission: None,
         }
         .read(None)
     }
@@ -393,6 +404,7 @@ impl IncrementalDocument {
             strict: false,
             max_decompressed_size: None,
             normal_offsets: Vec::new(),
+            admission: None,
         }
         .read(None)?;
 
@@ -437,6 +449,7 @@ impl IncrementalDocument {
             strict: false,
             max_decompressed_size: None,
             normal_offsets: Vec::new(),
+            admission: None,
         }
         .read(None)?;
 
@@ -462,6 +475,7 @@ impl TryInto<IncrementalDocument> for &[u8] {
             strict: false,
             max_decompressed_size: None,
             normal_offsets: Vec::new(),
+            admission: None,
         }
         .read(None)?;
 
@@ -486,6 +500,7 @@ pub struct Reader<'a> {
     /// object-boundary lookups can binary-search the successor offset instead
     /// of scanning all xref entries on each call.
     normal_offsets: Vec<usize>,
+    pub(crate) admission: Option<std::sync::Arc<Mutex<crate::admission::Context>>>,
 }
 
 /// Maximum allowed embedding of literal strings.
@@ -792,6 +807,9 @@ impl Reader<'_> {
         // Check if encrypted
         let is_encrypted = self.document.trailer.get(b"Encrypt").is_ok();
 
+        if is_encrypted && self.admission.is_some() {
+            return Err(Error::Unimplemented("encrypted admission provenance"));
+        }
         if is_encrypted {
             // For encrypted PDFs, use a special loading strategy
             self.load_encrypted_document(filter_func)?;
@@ -949,6 +967,19 @@ impl Reader<'_> {
         let object_streams = Mutex::new(vec![]);
 
         let normal_offsets = &self.normal_offsets;
+        let selected_containers: HashSet<u32> = if self.admission.is_some() {
+            self.document
+                .reference_table
+                .entries
+                .values()
+                .filter_map(|entry| match entry {
+                    XrefEntry::Compressed { container, .. } => Some(*container),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            HashSet::new()
+        };
 
         let entries_filter_map = |(&id, entry): (&_, &_)| -> Result<Option<(ObjectId, Object)>> {
             if let XrefEntry::Normal { offset, generation } = *entry {
@@ -981,16 +1012,28 @@ impl Reader<'_> {
 
                 if let Ok(stream) = object.as_stream() {
                     if stream.dict.has_type(b"ObjStm") && !is_encrypted {
-                        let obj_stream =
-                            match ObjectStream::parse_indexed_with_limit(stream, self.max_decompressed_size) {
-                                Ok(obj_stream) => obj_stream,
-                                // Not an encryption-related loss, so it obeys the same
-                                // strict-mode policy as any other load error.
-                                Err(e) => {
-                                    error!("Object stream load error for {object_id:?}: {e:?}");
-                                    return if self.strict { Err(e) } else { Ok(None) };
-                                }
-                            };
+                        if self.admission.is_some() {
+                            if !selected_containers.contains(&object_id.0) {
+                                return Ok(Some((object_id, object)));
+                            }
+                            if object_id.1 != 0 {
+                                return Err(Error::Unimplemented("object stream generation"));
+                            }
+                            crate::admission::check_decoder(stream)?;
+                        }
+                        let obj_stream = match if self.admission.is_some() {
+                            ObjectStream::parse_indexed_strict(stream, self.max_decompressed_size)
+                        } else {
+                            ObjectStream::parse_indexed_with_limit(stream, self.max_decompressed_size)
+                        } {
+                            Ok(obj_stream) => obj_stream,
+                            // Not an encryption-related loss, so it obeys the same
+                            // strict-mode policy as any other load error.
+                            Err(e) => {
+                                error!("Object stream load error for {object_id:?}: {e:?}");
+                                return if self.strict { Err(e) } else { Ok(None) };
+                            }
+                        };
                         let container_id = object_id.0;
                         let mut object_streams = object_streams.lock().unwrap();
                         if let Some(filter_func) = filter_func {
@@ -1055,6 +1098,24 @@ impl Reader<'_> {
                 .collect::<Result<BTreeMap<_, _>>>()?;
         }
 
+        if self.admission.is_some() {
+            let decoded = object_streams.lock().unwrap();
+            let decoded_ids: HashSet<ObjectId> = decoded.iter().map(|(id, _)| *id).collect();
+            for (&number, entry) in &self.document.reference_table.entries {
+                if let XrefEntry::Compressed { container, index } = entry {
+                    let found = decoded_ids.contains(&(number, 0));
+                    let valid_container = matches!(
+                        self.document.reference_table.get(*container),
+                        Some(XrefEntry::Normal { generation: 0, .. })
+                    );
+                    if !found || !valid_container {
+                        return Err(Error::InvalidObjectStream(format!(
+                            "unavailable selected member {number} container {container} index {index}"
+                        )));
+                    }
+                }
+            }
+        }
         // Only add entries, but never replace entries
         for (id, entry) in object_streams.into_inner().unwrap() {
             self.document.objects.entry(id).or_insert(entry);
@@ -1145,6 +1206,11 @@ impl Reader<'_> {
         let container_stream = container_obj.as_stream()?;
         if !container_stream.dict.has_type(b"ObjStm") {
             return Err(Error::InvalidObjectStream("container must have /Type /ObjStm".into()));
+        }
+        if self.admission.is_some() {
+            return Err(Error::Unimplemented(
+                "lazy compressed object resolution during admission",
+            ));
         }
         let object_stream = ObjectStream::parse_indexed_with_limit(container_stream, self.max_decompressed_size)?;
         object_stream
@@ -1374,6 +1440,12 @@ impl Reader<'_> {
                 }
             })?;
 
+        if let Some(context) = &self.admission {
+            context
+                .lock()
+                .unwrap()
+                .section(xref_start, None, crate::admission::Relation::Primary, &xref, &trailer)?;
+        }
         let size_bound = u32::try_from(
             trailer
                 .get(b"Size")
@@ -1432,6 +1504,15 @@ impl Reader<'_> {
                 {
                     return Err(Error::Xref(XrefError::StreamStart));
                 }
+                if let Some(context) = &self.admission {
+                    context.lock().unwrap().section(
+                        offset,
+                        Some(current),
+                        crate::admission::Relation::Supplement,
+                        &supplement,
+                        &supplement_trailer,
+                    )?;
+                }
                 xref.merge(supplement);
             }
             let Ok(value) = revision_trailer.get(b"Prev") else {
@@ -1462,8 +1543,15 @@ impl Reader<'_> {
                 return Err(Error::Xref(XrefError::PrevStart));
             }
             let (remaining, (previous, previous_trailer)) =
-                parser::xref_and_trailer_with_remainder(&self.buffer[offset..], self)
-                    .map_err(|_| Error::Xref(XrefError::PrevStart))?;
+                parser::xref_and_trailer_with_remainder(&self.buffer[offset..], self).map_err(|err| match &err {
+                    Error::InvalidStream(message)
+                        if self.admission.is_some()
+                            && message.starts_with("admission repeated classic xref identity ") =>
+                    {
+                        err
+                    }
+                    _ => Error::Xref(XrefError::PrevStart),
+                })?;
             let terminal = self.buffer.len() - remaining.len() == final_start;
             if offset >= current {
                 let fresh_linearized = entry_only
@@ -1477,6 +1565,15 @@ impl Reader<'_> {
                 }
             }
             terminal_reached |= terminal;
+            if let Some(context) = &self.admission {
+                context.lock().unwrap().section(
+                    offset,
+                    Some(current),
+                    crate::admission::Relation::Prior,
+                    &previous,
+                    &previous_trailer,
+                )?;
+            }
             revision_type = previous.cross_reference_type;
             xref.merge(previous);
             revision_trailer = previous_trailer;
@@ -1963,4 +2060,21 @@ fn object_marker_parsing_accepts_only_real_headers() {
     assert_eq!(Reader::parse_object_header(b"1 0obj"), None);
     assert_eq!(Reader::parse_object_header(b"1  obj"), None);
     assert_eq!(Reader::parse_object_header(b"x 0 obj"), None);
+}
+
+pub(crate) fn read_admission(
+    source: &[u8], max_decompressed_size: usize, admission: std::sync::Arc<Mutex<crate::admission::Context>>,
+) -> Result<Document> {
+    Reader {
+        buffer: source,
+        document: Document::new(),
+        encryption_state: None,
+        raw_objects: BTreeMap::new(),
+        password: None,
+        strict: true,
+        max_decompressed_size: Some(max_decompressed_size),
+        normal_offsets: Vec::new(),
+        admission: Some(admission),
+    }
+    .read(None)
 }

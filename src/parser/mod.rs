@@ -394,7 +394,19 @@ fn stream<'a>(
             return Err(nom::Err::Failure(NomError::from_error_kind(i, ErrorKind::LengthValue)));
         };
         match terminated(take(length), pair(opt(eol), tag(&b"endstream"[..]))).parse(i) {
-            Ok((remaining, data)) => Ok((remaining, Object::Stream(Stream::new(dict, data.to_vec())))),
+            Ok((remaining, data)) => {
+                let stream = if reader.admission.is_some() {
+                    Stream {
+                        dict,
+                        content: data.to_vec(),
+                        allows_compression: true,
+                        start_position: None,
+                    }
+                } else {
+                    Stream::new(dict, data.to_vec())
+                };
+                Ok((remaining, Object::Stream(stream)))
+            }
             Err(_) if recover_length && !reader.strict => {
                 // The scan must not cross into a neighbouring indirect object,
                 // so it stops at the xref-derived bound; parsing itself stays
@@ -463,6 +475,11 @@ fn _direct_object(depth: usize) -> impl Fn(ParserInput) -> NomResult<Object> {
 
 pub fn direct_object(input: ParserInput) -> Option<Object> {
     strip_nom(_direct_object(crate::reader::MAX_NESTING_DEPTH)(input))
+}
+
+pub(crate) fn direct_object_complete(input: ParserInput) -> Option<Object> {
+    let (remaining, object) = _direct_object(crate::reader::MAX_NESTING_DEPTH)(input).ok()?;
+    remaining.iter().all(u8::is_ascii_whitespace).then_some(object)
 }
 
 fn object<'a>(
@@ -582,7 +599,14 @@ pub fn binary_mark(input: ParserInput) -> Option<Vec<u8>> {
 }
 
 /// Decode CrossReferenceTable
+#[cfg(test)]
 fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
+    xref_with_admission(input, strict, None)
+}
+
+fn xref_with_admission<'a>(
+    input: ParserInput<'a>, strict: bool, conflict: Option<&std::cell::Cell<Option<u32>>>,
+) -> NomResult<'a, Xref> {
     // ISO 32000-1 s7.5.4 requires every entry to be exactly 20 bytes, ending in one of the
     // 2-byte terminators SP CR, SP LF or CR LF. Many generators instead emit 19-byte entries
     // ending in a bare LF, which qpdf, pikepdf, PDFium and PDF.js all accept. Accept those
@@ -611,8 +635,18 @@ fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
         map_res(fold_many1(
             xref_section,
             || -> Result<Xref, ()> { Ok(Xref::new(0, XrefType::CrossReferenceTable)) },
-            |xref, ((start, _count), entries)| {
+            |xref, ((start, count), entries)| {
                 let mut xref = xref?;
+                // In admission, a declared range must describe exactly the parsed
+                // entries and fit the supported identity space. Otherwise overlap
+                // cannot be established from the entries being folded.
+                if conflict.is_some()
+                    && (entries.len() != count as usize
+                        || (count > 0
+                            && u32::try_from(start).ok().and_then(|start| start.checked_add(count - 1)).is_none()))
+                {
+                    return Err(());
+                }
                 let mut skipped = 0usize;
                 for (index, ((offset, generation), is_normal)) in entries.into_iter().enumerate() {
                     // Unsupported object numbers cannot claim a supported identity.
@@ -627,6 +661,12 @@ fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
                     } else {
                         XrefEntry::Free { next_free: offset, generation }
                     };
+                    // Detect repeated identities while both entries are still observable.
+                    // Ordinary readers, including strict readers, retain their overwrite behavior.
+                    if let Some(conflict) = conflict.filter(|_| xref.get(id).is_some()) {
+                        conflict.set(Some(id));
+                        return Err(());
+                    }
                     xref.insert(id, entry);
                 }
                 if skipped > 0 {
@@ -654,20 +694,27 @@ pub fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(X
 pub(crate) fn xref_and_trailer_with_remainder<'a>(
     input: ParserInput<'a>, reader: &Reader,
 ) -> crate::Result<(ParserInput<'a>, (Xref, Dictionary))> {
-    let xref_trailer = map(pair(|i| xref(i, reader.strict), trailer), |(mut xref, trailer)| {
-        xref.size = trailer
-            .get(b"Size")
-            .and_then(Object::as_i64)
-            .map_err(|_| error::ParseError::InvalidTrailer)? as u32;
-        Ok((xref, trailer))
-    });
+    let conflict = std::cell::Cell::new(None);
+    let xref_trailer = map(
+        pair(
+            |i| xref_with_admission(i, reader.strict, reader.admission.as_ref().map(|_| &conflict)),
+            trailer,
+        ),
+        |(mut xref, trailer)| {
+            xref.size = trailer
+                .get(b"Size")
+                .and_then(Object::as_i64)
+                .map_err(|_| error::ParseError::InvalidTrailer)? as u32;
+            Ok((xref, trailer))
+        },
+    );
     let result = alt((
         xref_trailer,
         (|input| {
             indirect_object_with_remainder(input, 0, None, reader, &mut HashSet::new(), false, None)
-                .map(|(remaining, (_, obj))| {
+                .map(|(remaining, (id, obj))| {
                     let res = match obj {
-                        Object::Stream(stream) => decode_xref_stream_with_limit(stream, reader.max_decompressed_size),
+                        Object::Stream(stream) => crate::admission::decode_xref(reader, input, id, stream),
                         _ => Err(crate::error::ParseError::InvalidXref.into()),
                     };
                     (remaining, res)
@@ -678,9 +725,14 @@ pub(crate) fn xref_and_trailer_with_remainder<'a>(
                 })
         }),
     ))
-    .parse(input)
-    .map_err(|_| error::ParseError::InvalidTrailer)?;
-    let (remaining, value) = result;
+    .parse(input);
+    if let Some(id) = conflict.get() {
+        let offset = reader.buffer.len() - input.len();
+        return Err(Error::InvalidStream(format!(
+            "admission repeated classic xref identity {id} at section offset {offset}"
+        )));
+    }
+    let (remaining, value) = result.map_err(|_| error::ParseError::InvalidTrailer)?;
     Ok((remaining, value?))
 }
 

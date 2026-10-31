@@ -26,6 +26,7 @@ mod processor;
 mod toc;
 mod writer;
 
+mod admission;
 mod load_options;
 mod object_stream;
 mod parser;
@@ -36,6 +37,7 @@ mod save_options;
 #[cfg(feature = "font_embedding")]
 mod font;
 
+pub use admission::{Admission, Member, Relation, Section};
 pub use document::Document;
 pub use object::{Dictionary, Object, ObjectId, Stream, StringFormat};
 

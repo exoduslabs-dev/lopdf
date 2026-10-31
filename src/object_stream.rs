@@ -65,15 +65,35 @@ impl ObjectStream {
     pub(crate) fn parse_indexed_with_limit(
         stream: &Stream, max_decompressed_size: Option<usize>,
     ) -> Result<BTreeMap<usize, (ObjectId, Object)>> {
-        let content = match max_decompressed_size {
-            // Object streams are decoded while the document is loaded, so
-            // enforcing the limit here bounds the memory a single stream can use.
-            Some(max) => stream.get_plain_content_with_limit(max)?,
-            None => stream.get_plain_content()?,
+        Self::parse_indexed_inner(stream, max_decompressed_size, false)
+    }
+
+    pub(crate) fn parse_indexed_strict(
+        stream: &Stream, max_decompressed_size: Option<usize>,
+    ) -> Result<BTreeMap<usize, (ObjectId, Object)>> {
+        Self::parse_indexed_inner(stream, max_decompressed_size, true)
+    }
+
+    fn parse_indexed_inner(
+        stream: &Stream, max_decompressed_size: Option<usize>, strict: bool,
+    ) -> Result<BTreeMap<usize, (ObjectId, Object)>> {
+        let content = if strict {
+            crate::admission::decode_content(stream, max_decompressed_size)?
+        } else {
+            match max_decompressed_size {
+                // Object streams are decoded while the document is loaded, so
+                // enforcing the limit here bounds the memory a single stream can use.
+                Some(max) => stream.get_plain_content_with_limit(max)?,
+                None => stream.get_plain_content()?,
+            }
         };
 
         if content.is_empty() {
-            return Ok(BTreeMap::new());
+            return if strict {
+                Err(Error::InvalidObjectStream("empty selected object stream".into()))
+            } else {
+                Ok(BTreeMap::new())
+            };
         }
 
         let first_offset = stream
@@ -96,9 +116,34 @@ impl ObjectStream {
             warn!("object stream: the object stream dictionary specifies a wrong number of objects")
         }
 
+        if strict {
+            let expected = usize::try_from(n).ok().and_then(|n| n.checked_mul(2));
+            if expected != Some(numbers.len()) || numbers.iter().any(Option::is_none) {
+                return Err(Error::InvalidObjectStream(
+                    "invalid selected object stream header".into(),
+                ));
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut previous = None;
+            for pair in numbers.chunks_exact(2) {
+                let id = pair[0].ok_or_else(|| Error::InvalidObjectStream("invalid member id".into()))?;
+                let relative =
+                    pair[1].ok_or_else(|| Error::InvalidObjectStream("invalid member offset".into()))? as usize;
+                let start = first_offset
+                    .checked_add(relative)
+                    .filter(|&v| v < content.len())
+                    .ok_or(Error::InvalidOffset(relative))?;
+                if !seen.insert(id) || previous.is_some_and(|p| start <= p) {
+                    return Err(Error::InvalidObjectStream(
+                        "duplicate or unordered member header".into(),
+                    ));
+                }
+                previous = Some(start);
+            }
+        }
         let chunks_filter_map = |(index, chunk): (usize, &[_])| {
             let id = chunk[0]?;
-            let offset = first_offset + chunk[1]? as usize;
+            let offset = first_offset.checked_add(chunk[1]? as usize)?;
 
             if offset >= content.len() {
                 warn!("out-of-bounds offset in object stream");
@@ -113,23 +158,37 @@ impl ObjectStream {
                 warn!("only whitespace after offset in object stream");
                 return None;
             }
-            let object = parser::direct_object(&content[start..])?;
+            let object = if strict {
+                let end = numbers
+                    .get((index + 1) * 2 + 1)
+                    .and_then(|n| *n)
+                    .and_then(|relative| first_offset.checked_add(relative as usize))
+                    .unwrap_or(content.len());
+                parser::direct_object_complete(content.get(start..end)?)?
+            } else {
+                parser::direct_object(&content[start..])?
+            };
 
             Some((index, ((id, 0), object)))
         };
         #[cfg(feature = "rayon")]
-        let objects = numbers[..len]
+        let objects: BTreeMap<usize, (ObjectId, Object)> = numbers[..len]
             .par_chunks(2)
             .enumerate()
             .filter_map(chunks_filter_map)
             .collect();
         #[cfg(not(feature = "rayon"))]
-        let objects = numbers[..len]
+        let objects: BTreeMap<usize, (ObjectId, Object)> = numbers[..len]
             .chunks(2)
             .enumerate()
             .filter_map(chunks_filter_map)
             .collect();
 
+        if strict && objects.len() != numbers.len() / 2 {
+            return Err(Error::InvalidObjectStream(
+                "invalid or overlapping selected member".into(),
+            ));
+        }
         Ok(objects)
     }
 
@@ -358,5 +417,28 @@ impl ObjectStreamBuilder {
     /// Get the current compression_level setting
     pub fn get_compression_level(&self) -> u32 {
         self.compression_level
+    }
+}
+
+#[cfg(test)]
+mod admission_header_tests {
+    use super::*;
+    use crate::Dictionary;
+
+    fn selected(content: &[u8], first: i64, count: i64) -> Stream {
+        let mut dictionary = Dictionary::new();
+        dictionary.set("First", first);
+        dictionary.set("N", count);
+        Stream::new(dictionary, content.to_vec())
+    }
+
+    #[test]
+    fn selected_header_rejects_ambiguous_and_overlapping_members() {
+        assert!(ObjectStream::parse_indexed_strict(&selected(b"1 0 2 2 7 8", 8, 2), Some(100)).is_ok());
+        assert!(ObjectStream::parse_indexed_strict(&selected(b"1 0 1 2 7 8", 8, 2), Some(100)).is_err());
+        assert!(ObjectStream::parse_indexed_strict(&selected(b"1 0 2 0 7 8", 8, 2), Some(100)).is_err());
+        assert!(ObjectStream::parse_indexed_strict(&selected(b"1 0 2 2 7 8", 8, 1), Some(100)).is_err());
+        assert!(ObjectStream::parse_indexed_strict(&selected(b"1 0 2 1 77 8", 8, 2), Some(100)).is_err());
+        assert!(ObjectStream::parse_indexed_strict(&selected(b"1 x 7", 4, 1), Some(100)).is_err());
     }
 }
