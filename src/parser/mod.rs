@@ -760,27 +760,43 @@ fn content_space(input: ParserInput) -> NomResult<()> {
 }
 
 fn operator(input: ParserInput) -> NomResult<String> {
+    // PDF 32000-1:2008 §7.2 and §7.8.2: consecutive regular bytes
+    // form one token. Table 113 defines the digit-bearing d0 and d1.
     map_res(
-        take_while1(|c: u8| c.is_ascii_alphabetic() || b"*'\"".contains(&c)),
+        verify(take_while1(is_regular), |op: ParserInput| {
+            matches!(op, b"d0" | b"d1") || op.iter().all(|c| c.is_ascii_alphabetic() || b"*'\"".contains(c))
+        }),
         |op: ParserInput| str::from_utf8(op).map(Into::into),
     )
     .parse(input)
 }
 
 fn operand(input: ParserInput) -> NomResult<Object> {
+    fn atomic_operand_end(input: ParserInput) -> NomResult<()> {
+        if input.first().is_some_and(|byte| is_regular(*byte)) {
+            return Err(nom::Err::Error(NomError::new(input, ErrorKind::Verify)));
+        }
+        Ok((input, ()))
+    }
+
     terminated(
         alt((
-            null,
-            boolean,
-            map(real, Object::Real),
-            map(integer, Object::Integer),
-            map(name, Object::Name),
+            terminated(
+                alt((
+                    null,
+                    boolean,
+                    map(real, Object::Real),
+                    map(integer, Object::Integer),
+                    map(name, Object::Name),
+                )),
+                atomic_operand_end,
+            ),
             map(literal_string, Object::string_literal),
             hexadecimal_string,
             map(array(crate::reader::MAX_NESTING_DEPTH), Object::Array),
             map(dictionary, Object::Dictionary),
         )),
-        content_space,
+        space,
     )
     .parse(input)
 }
@@ -790,8 +806,8 @@ fn operation(input: ParserInput) -> NomResult<Operation> {
         preceded(
             // A comment consumes its end-of-line marker, so also skip any
             // white space that follows it (e.g. an indented next line).
-            many0(terminated(comment, content_space)),
-            alt((inline_image, terminated(pair(many0(operand), operator), content_space))),
+            many0(terminated(comment, white_space)),
+            alt((inline_image, terminated(pair(many0(operand), operator), white_space))),
         ),
         |(operands, operator)| Operation { operator, operands },
     )
@@ -898,9 +914,9 @@ fn image_data_stream(input: ParserInput, stream_dict: Dictionary) -> crate::Resu
 
 fn _content(input: ParserInput) -> NomResult<Content<Vec<Operation>>> {
     delimited(
-        content_space,
+        white_space,
         map(many0(operation), |operations| Content { operations }),
-        many0(terminated(comment, content_space)),
+        many0(terminated(comment, white_space)),
     )
     .parse(input)
 }
@@ -1376,6 +1392,49 @@ EI";
         assert_eq!(content.operations.len(), 2);
         assert_eq!(content.operations[0].operator, "q");
         assert_eq!(content.operations[1].operator, "cm");
+    }
+
+    #[test]
+    fn type3_metrics_are_single_operator_tokens() {
+        let data = b"\x0c500% width\n0\0d0% metrics\n0 0 500 500 re f\n500 0 0 0 500 500 d1";
+        let decoded = content_strict(data).unwrap();
+        let ops = &decoded.operations;
+        assert_eq!(
+            ops.iter().map(|op| op.operator.as_str()).collect::<Vec<_>>(),
+            ["d0", "re", "f", "d1"]
+        );
+        assert_eq!(ops[0].operands, [Object::Integer(500), Object::Integer(0)]);
+        assert_eq!(ops[1].operands.len(), 4);
+        assert!(ops[2].operands.is_empty());
+        assert_eq!(ops[3].operands.len(), 6);
+        let encoded = decoded.encode().unwrap();
+        let round_trip = content_strict(&encoded).unwrap();
+        assert_eq!(round_trip.operations.len(), ops.len());
+        for (left, right) in round_trip.operations.iter().zip(ops) {
+            assert_eq!(left.operator, right.operator);
+            assert_eq!(left.operands, right.operands);
+        }
+    }
+
+    #[test]
+    fn type3_metric_prefixes_in_other_tokens_are_not_operators() {
+        for wrong in [
+            b"500 0 d01 f".as_slice(),
+            b"500 0 d1f",
+            b"500 0 d0d1",
+            b"500 0d0",
+            b"500 0 0 0 500 500d1",
+            b"500 0 0 0 500 500.0d1",
+            b"500 0 0 0 500-500 d1",
+            b"true0 d0",
+            b"/Bad#G0 d0",
+        ] {
+            assert!(content_strict(wrong).is_err());
+        }
+        let decoded = content_strict(b"[(d0)(d1)] 0 d").unwrap();
+        assert_eq!(decoded.operations[0].operator, "d");
+        let decoded = content_strict(b"500 0 d0(A) Tj").unwrap();
+        assert_eq!(decoded.operations.len(), 2);
     }
 
     #[test]
